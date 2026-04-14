@@ -15,6 +15,14 @@ class ProductTrader:
     def get_orders(self, state: TradingState) -> List[Order]:
         raise NotImplementedError
 
+    # --- state persistence (round-trips through traderData JSON) ---
+
+    def load_state(self, data: dict) -> None:
+        """Called by Trader.run() before get_orders. Restore instance state from data."""
+
+    def dump_state(self, data: dict) -> None:
+        """Called by Trader.run() after get_orders. Write instance state back into data."""
+
     # --- helpers ---
 
     def best_bid(self, order_depth: OrderDepth) -> int | None:
