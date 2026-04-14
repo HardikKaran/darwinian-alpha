@@ -27,15 +27,9 @@ import math
 TRADER_CLASS = '''
 class Trader:
     def run(self, state: TradingState):
-        result: Dict[str, List[Order]] = {}
-        conversions = 0
-        trader_data = ""
-
-        # TODO: instantiate and dispatch to per-product traders
-        for product in state.order_depths:
-            result[product] = []
-
-        return result, conversions, trader_data
+        # Safe default template: place no orders.
+        # Returning unknown product keys can crash some backtester configs.
+        return {}, 0, ""
 '''
 
 
