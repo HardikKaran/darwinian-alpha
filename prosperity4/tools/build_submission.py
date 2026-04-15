@@ -25,11 +25,29 @@ import math
 '''
 
 TRADER_CLASS = '''
+
+STRATEGIES: List[ProductTrader] = [
+    AshMarketMaker(symbol="ASH_COATED_OSMIUM",       position_limit=80),
+    PepperTrendTrader(symbol="INTARIAN_PEPPER_ROOT", position_limit=80),
+]
+
+
 class Trader:
+
     def run(self, state: TradingState):
-        # Safe default template: place no orders.
-        # Returning unknown product keys can crash some backtester configs.
-        return {}, 0, ""
+        trader_data: dict = json.loads(state.traderData) if state.traderData else {}
+
+        for s in STRATEGIES:
+            s.load_state(trader_data)
+
+        result: Dict[str, List[Order]] = {}
+        for s in STRATEGIES:
+            result[s.symbol] = s.get_orders(state)
+
+        for s in STRATEGIES:
+            s.dump_state(trader_data)
+
+        return result, 0, json.dumps(trader_data)
 '''
 
 

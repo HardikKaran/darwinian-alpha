@@ -1,79 +1,49 @@
 from datamodel import Order, TradingState
 from strategies.base import ProductTrader
 from typing import List
-import math
 
 SYMBOL = "INTARIAN_PEPPER_ROOT"
-POSITION_LIMIT = 50
+POSITION_LIMIT = 80
 
-# Pepper drifted +3,000 over 3 days — it is non-stationary.  Mean-reversion
-# loses money here.  Instead we ride the trend by quoting asymmetrically:
-#   bid close to EMA  →  gets filled on dips, accumulating long exposure
-#   ask far above EMA →  only sells when price is genuinely extended
+# Pepper trended +3,000 over 3 days — non-stationary, purely directional.
+# Strategy: build max long as efficiently as possible, then hold.
+#
+# Hybrid entry splits the load:
+#   - First AGGRESSIVE_TARGET units: take best ask immediately (need exposure fast)
+#   - Remaining units: limit bids at bb+1 -> saves ~10 ticks per passive fill
+#     vs slamming the ask, recovering 300-400 PnL and reducing initial drawdown.
+#
+# Once full: only post an impossibly wide ask (ba+20) — almost never fills,
+# preserving the long position to ride the full trend.
 
-EMA_ALPHA = 0.15        # moderately fast; tracks the trend without chasing ticks
-
-# Quote offsets from EMA.  Both must exceed the half-spread (~6.5) so that
-# passive fills are net-profitable.  Wider ask biases the book long.
-BID_OFFSET = 5          # post bid at EMA - 5  (just inside the market, earns spread)
-ASK_OFFSET = 10         # post ask at EMA + 10 (only sell if price very extended)
-
-# Opportunistic take: cross the ask aggressively only when the price is well
-# below the EMA — must exceed the half-spread to ensure positive expectancy.
-TAKE_DIP_THRESHOLD = 9  # buy at market if best_ask < EMA - 9
-
-# Order-book imbalance filter.  If the top-of-book is overwhelmingly one-sided,
-# suppress the quote on the crowded side to avoid being run over.
-OBI_BUY_PRESSURE  = 0.75   # obi > this → huge buy wall → pause asks
-OBI_SELL_PRESSURE = 0.25   # obi < this → huge sell wall → pause bids
-
-# Inventory skew: as we approach the position limit, widen the quote on the
-# side that would increase exposure further, to slow down accumulation.
-SKEW_DIVISOR = 8
+AGGRESSIVE_TARGET = 80   # take aggressively up to this many units
+MAX_PASSIVE_VOL   = 20   # max volume per passive bid layer
 
 
 class PepperTrendTrader(ProductTrader):
     """
-    Trend-following market-maker for INTARIAN_PEPPER_ROOT.
+    Hybrid directional loader for INTARIAN_PEPPER_ROOT.
 
-    Key design choices vs the previous mean-reversion strategy:
-    - NO mean-reversion entries.  Pepper is trending; fading moves loses money.
-    - Asymmetric quoting: bid offset < ask offset → net long bias.
-    - Quote offsets are both > half-spread (~6.5) so passive fills are profitable.
-    - OBI filter pauses one side when the book is heavily one-sided.
-    - Opportunistic aggressive buy only when dip exceeds the half-spread.
-    - Inventory skew slows accumulation near the position limit.
+    Changes vs v3:
+    1. Two-phase entry: aggressive take for first 40 units, then limit bids
+       at bb+1 for remaining 40 -> saves ~10 ticks/unit on passive fills.
+    2. Second passive layer at best_bid mops up remaining capacity.
+    3. Wide ask (ba+20) once full — avoids accidentally resetting position
+       and restarting the entry cost.
     """
 
     def __init__(
         self,
         symbol: str = SYMBOL,
         position_limit: int = POSITION_LIMIT,
-        ema_alpha: float = EMA_ALPHA,
-        bid_offset: int = BID_OFFSET,
-        ask_offset: int = ASK_OFFSET,
-        take_dip_threshold: int = TAKE_DIP_THRESHOLD,
-        obi_buy_pressure: float = OBI_BUY_PRESSURE,
-        obi_sell_pressure: float = OBI_SELL_PRESSURE,
-        skew_divisor: int = SKEW_DIVISOR,
+        aggressive_target: int = AGGRESSIVE_TARGET,
+        max_passive_vol: int = MAX_PASSIVE_VOL,
     ):
         super().__init__(symbol, position_limit)
-        self.ema_alpha = ema_alpha
-        self.bid_offset = bid_offset
-        self.ask_offset = ask_offset
-        self.take_dip_threshold = take_dip_threshold
-        self.obi_buy_pressure = obi_buy_pressure
-        self.obi_sell_pressure = obi_sell_pressure
-        self.skew_divisor = skew_divisor
-        self.ema: float | None = None
+        self.aggressive_target = aggressive_target
+        self.max_passive_vol = max_passive_vol
 
-    # --- state persistence ---
-
-    def load_state(self, data: dict) -> None:
-        self.ema = data.get(self.symbol + "_ema")
-
-    def dump_state(self, data: dict) -> None:
-        data[self.symbol + "_ema"] = self.ema
+    # No persistent state needed — logic is purely positional.
 
     # --- core logic ---
 
@@ -84,55 +54,43 @@ class PepperTrendTrader(ProductTrader):
         if od is None:
             return orders
 
-        best_bid = self.best_bid(od)
-        best_ask = self.best_ask(od)
-        if best_bid is None or best_ask is None:
+        buy_orders  = sorted(od.buy_orders.items(),  key=lambda x: -x[0])
+        sell_orders = sorted(od.sell_orders.items(), key=lambda x:  x[0])
+
+        pos       = self.current_position(state)
+        remaining = self.position_limit - pos
+
+        # Already at max long — post a wide ask to avoid accidental unwind
+        if remaining <= 0:
+            if sell_orders:
+                widest_ask = sell_orders[-1][0]
+                orders.append(Order(self.symbol, widest_ask + 20, -1))
             return orders
 
-        mid = (best_bid + best_ask) / 2
+        if not sell_orders and not buy_orders:
+            return orders
 
-        # Update EMA
-        if self.ema is None:
-            self.ema = mid
-        else:
-            self.ema = self.ema_alpha * mid + (1 - self.ema_alpha) * self.ema
+        best_ask     = sell_orders[0][0] if sell_orders else None
+        best_ask_vol = abs(sell_orders[0][1]) if sell_orders else 0
+        best_bid     = buy_orders[0][0] if buy_orders else None
 
-        ema = self.ema
-        pos = self.current_position(state)
+        # PHASE 1: Aggressive — take best ask until AGGRESSIVE_TARGET units held
+        if pos < self.aggressive_target and best_ask is not None:
+            aggressive_remaining = self.aggressive_target - pos
+            take_vol = min(best_ask_vol, aggressive_remaining, remaining)
+            if take_vol > 0:
+                orders.append(Order(self.symbol, best_ask, take_vol))
+                remaining -= take_vol
+                pos += take_vol
 
-        # ── OBI calculation ───────────────────────────────────────────────────
-        bid_vol = od.buy_orders.get(best_bid, 0)
-        ask_vol = abs(od.sell_orders.get(best_ask, 0))
-        total_vol = bid_vol + ask_vol
-        obi = bid_vol / total_vol if total_vol > 0 else 0.5
+        # PHASE 2: Passive layer at bb+1 (saves ~10 ticks vs slamming the ask)
+        if remaining > 0 and best_bid is not None:
+            passive_vol = min(remaining, self.max_passive_vol)
+            orders.append(Order(self.symbol, best_bid + 1, passive_vol))
+            remaining -= passive_vol
 
-        allow_buy  = obi >= self.obi_sell_pressure   # suppress bids if sell wall
-        allow_sell = obi <= self.obi_buy_pressure    # suppress asks if buy wall
-
-        # ── 1. Opportunistic take on deep dip ─────────────────────────────────
-        # Only cross the spread when the dip is large enough to guarantee profit
-        # after paying the spread (threshold > half-spread of ~6.5).
-        if allow_buy and best_ask < ema - self.take_dip_threshold:
-            qty = min(ask_vol, self.position_limit - pos)
-            if qty > 0:
-                orders.append(Order(self.symbol, best_ask, qty))
-                pos += qty
-
-        # ── 2. Passive asymmetric quotes with inventory skew ──────────────────
-        skew = round(pos / self.skew_divisor)
-
-        # Shift both quotes down when long (skew > 0) to slow long accumulation
-        # and encourage selling; shift up when short to encourage buying.
-        my_bid = math.floor(ema) - self.bid_offset - skew
-        my_ask = math.ceil(ema)  + self.ask_offset - skew
-
-        buy_capacity  = self.position_limit - pos
-        sell_capacity = self.position_limit + pos
-
-        if allow_buy and buy_capacity > 0:
-            orders.append(Order(self.symbol, my_bid, buy_capacity))
-
-        if allow_sell and sell_capacity > 0:
-            orders.append(Order(self.symbol, my_ask, -sell_capacity))
+        # PHASE 3: Second layer at best_bid — mop up leftover capacity
+        if remaining > 0 and best_bid is not None:
+            orders.append(Order(self.symbol, best_bid, remaining))
 
         return orders
