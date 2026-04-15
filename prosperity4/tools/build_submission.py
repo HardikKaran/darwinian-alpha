@@ -35,9 +35,13 @@ class Trader:
 
 def collect_strategy_source() -> str:
     parts = []
-    for path in sorted(STRATEGIES_DIR.glob("*.py")):
-        if path.name == "__init__.py":
-            continue
+    paths = [p for p in STRATEGIES_DIR.glob("*.py") if p.name != "__init__.py"]
+
+    # Ensure base class definitions are emitted before strategy modules
+    # that inherit from them.
+    paths.sort(key=lambda p: (0 if p.name == "base.py" else 1, p.name))
+
+    for path in paths:
         src = path.read_text(encoding="utf-8")
         # Strip relative imports — they won't work in the merged file
         lines = [l for l in src.splitlines() if not l.startswith("from strategies")]
