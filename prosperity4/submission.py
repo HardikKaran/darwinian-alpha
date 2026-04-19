@@ -1,21 +1,24 @@
-# submission.py — Round 2 v2
+# submission.py — Round 2 v3
 # Parameters chosen from round2_eda.ipynb backtest analysis + IMC platform log tuning.
 #
 # ASH_COATED_OSMIUM  (stationary ~10 000)
-#   Strategy : wall-mid market-maker, taker + passive
-#   Taker    : buy any ask < FV, sell any bid > FV (dominates PnL)
-#   Passive  : overbid/undercut best standing order to sit INSIDE the spread
-#              (vs v1's fixed fv±3 which sat ~11 ticks below best_ask → near-zero fills)
-#   Skew     : position/20 shift keeps quotes centred as inventory builds
+#   Strategy : best-mid market-maker, taker + passive
+#   FV       : best_mid = (best_bid + best_ask) / 2 − inventory_skew
+#              v2 used wall_mid (deepest levels) which could sit 5+ ticks below best_mid
+#              when spread is narrow at best levels but wide at deep levels.
+#              wall_mid caused: (a) passive bids 8 ticks below best_bid → almost no fills;
+#              (b) taker-sells when bid > wall_mid but bid < best_mid → selling below FV.
+#   Passive  : bid at best_bid+1, ask at best_ask-1 (inside the real spread, queue priority)
+#              Falls back to best_bid / best_ask when FV is between them.
+#              Skips side when inventory skew moves FV beyond standing best level.
+#   Taker    : buy when ask < fv, sell when bid > fv (fv = best_mid − skew)
+#   Skew     : pos/20 shift leans quotes against inventory buildup
 #
 # INTARIAN_PEPPER_ROOT  (trending +27% over 3 days, I(1))
-#   Strategy : best-ask-only directional loader (v2 improvement)
-#   Reasoning: ba−bb ≥ 2 always → passive bb+1 bids NEVER cross the ask.
-#              Trend value (~240 000) >> spread cost (~560). Miss the trend = miss everything.
-#   v1 flaw  : swept ALL ask levels per tick, paying ask_2 when ask_1 ran out.
-#              IMC log shows 22 units bought at +3 ticks above best ask at ts=100.
-#   Fix      : take only best ask level per tick → lower avg entry cost, same exposure.
-#   Defence  : once pos=80 post an impossibly wide ask (deepest_ask+20) to guard the long.
+#   Strategy : best-ask-only directional loader
+#   v2 fix   : take only best ask per tick (not all levels) → lower avg entry cost.
+#   v3 fix   : guard against empty asks (IndexError when asks=[] but bids exist).
+#   Defence  : once pos=80 post impossibly wide ask (deepest_ask+20) to guard the long.
 
 from datamodel import OrderDepth, TradingState, Order
 from typing import Dict, List
@@ -33,9 +36,6 @@ PEPPER_LIMIT  = 80
 ASH_SKEW_DIV   = 20   # inventory skew divisor (softer = less over-correction)
 ASH_MAX_VOL    = 25   # max passive quote volume per side (prevents limit dumps)
 
-# PEPPER parameters
-PEPPER_AGG_TARGET = 80   # take aggressively until pos = 80 (full_agg)
-
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Helpers
@@ -48,12 +48,6 @@ def _sorted_asks(od: OrderDepth):
     """Ascending list of (price, abs_volume) for asks."""
     return [(p, abs(v)) for p, v in sorted(od.sell_orders.items(), key=lambda x: x[0])]
 
-def _wall_mid(bids, asks) -> float | None:
-    """Average of DEEPEST resting bid and ask (spoof-resistant fair value)."""
-    if not bids or not asks:
-        return None
-    return (bids[-1][0] + asks[-1][0]) / 2.0
-
 
 # ─────────────────────────────────────────────────────────────────────────────
 # ASH market-maker
@@ -62,12 +56,10 @@ def _ash_orders(od: OrderDepth, pos: int) -> List[Order]:
     """
     Two-phase market-maker for ASH_COATED_OSMIUM.
 
-    Phase 1 – Taker: sweep any ask strictly inside wall_mid (buy) or
-              any bid strictly above wall_mid (sell).  Accounts for ~650
-              fill events over 3 days and dominates PnL.
+    Phase 1 – Taker: sweep any ask below best_mid FV (buy) or
+              any bid above best_mid FV (sell).  Dominates PnL.
 
-    Phase 2 – Passive: post bid at wall_mid−X, ask at wall_mid+X.
-              Accounts for ~75 fill events at X=3 (only viable X).
+    Phase 2 – Passive: overbid/undercut best standing order inside spread.
               Quotes are inventory-skewed and capped at ASH_MAX_VOL.
     """
     orders: List[Order] = []
@@ -78,13 +70,10 @@ def _ash_orders(od: OrderDepth, pos: int) -> List[Order]:
     if not bids or not asks:
         return orders
 
-    wm = _wall_mid(bids, asks)
-    if wm is None:
-        return orders
-
     # Inventory skew: nudge FV toward neutral to lean against inventory
+    best_mid = (bids[0][0] + asks[0][0]) / 2.0
     skew = pos / ASH_SKEW_DIV
-    fv   = wm - skew
+    fv   = best_mid - skew
 
     max_buy  = ASH_LIMIT - pos
     max_sell = ASH_LIMIT + pos
@@ -96,7 +85,7 @@ def _ash_orders(od: OrderDepth, pos: int) -> List[Order]:
             orders.append(Order(ASH_SYMBOL, ask_price, vol))
             max_buy -= vol
             pos     += vol
-        elif ask_price <= wm and pos < -5 and max_buy > 0:   # flatten short
+        elif ask_price <= best_mid and pos < -5 and max_buy > 0:   # flatten short
             vol = min(ask_vol, min(-pos, max_buy))
             orders.append(Order(ASH_SYMBOL, ask_price, vol))
             max_buy -= vol
@@ -108,7 +97,7 @@ def _ash_orders(od: OrderDepth, pos: int) -> List[Order]:
             orders.append(Order(ASH_SYMBOL, bid_price, -vol))
             max_sell -= vol
             pos      -= vol
-        elif bid_price >= wm and pos > 5 and max_sell > 0:   # flatten long
+        elif bid_price >= best_mid and pos > 5 and max_sell > 0:   # flatten long
             vol = min(bid_vol, min(pos, max_sell))
             orders.append(Order(ASH_SYMBOL, bid_price, -vol))
             max_sell -= vol
@@ -117,11 +106,11 @@ def _ash_orders(od: OrderDepth, pos: int) -> List[Order]:
     # ── Phase 2: passive quotes — overbid/undercut best standing orders ──────────
     # Post inside the spread (at best_bid+1 / best_ask-1) for much higher fill rate.
     # Fallback to fv±1 if no suitable standing level exists.
-    wall_bid = bids[-1][0]   # deepest bid (used for wall_mid)
-    wall_ask = asks[-1][0]   # deepest ask
+    best_bid = bids[0][0]
+    best_ask = asks[0][0]
 
     # Bid side: find highest standing bid with vol>1 below FV, overbid it
-    passive_bid = wall_bid + 1
+    passive_bid = best_bid
     for bp, bv in bids:
         overbid = bp + 1
         if bv > 1 and overbid < fv:
@@ -132,7 +121,7 @@ def _ash_orders(od: OrderDepth, pos: int) -> List[Order]:
             break
 
     # Ask side: find lowest standing ask with vol>1 above FV, undercut it
-    passive_ask = wall_ask - 1
+    passive_ask = best_ask
     for ap, av in asks:
         undercut = ap - 1
         if av > 1 and undercut > fv:
@@ -179,7 +168,6 @@ def _pepper_orders(od: OrderDepth, pos: int) -> List[Order]:
     orders: List[Order] = []
 
     asks = _sorted_asks(od)
-    bids = _sorted_bids(od)
 
     remaining = PEPPER_LIMIT - pos
 
@@ -190,7 +178,7 @@ def _pepper_orders(od: OrderDepth, pos: int) -> List[Order]:
             orders.append(Order(PEPPER_SYMBOL, guard_ask, -1))
         return orders
 
-    if not asks and not bids:
+    if not asks:
         return orders
 
     # Take only the best ask level this tick.
